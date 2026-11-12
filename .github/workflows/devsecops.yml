@@ -1,0 +1,181 @@
+name: Esteira DevSecOps - RM565184
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# token com o minimo possivel, cada job pede o que precisar
+permissions:
+  contents: read
+
+env:
+  IMAGEM: ctmarket:565184
+  PORTA: "8476"
+  TRIVY_VERSAO: 0.76.2
+  TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  GITLEAKS_VERSAO: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  # 1 - build
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.8"
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          pip install -r worker/requirements.txt
+      - name: Compilar
+        run: python -m compileall -q .
+
+  # 2 - SAST
+  sast:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - run: pip install semgrep==1.185.0
+      - name: Semgrep (falha com achado de severidade alta)
+        run: |
+          semgrep scan --config p/python --config p/flask --config p/security-audit \
+            --config p/owasp-top-ten --config p/secrets --metrics=off \
+            --severity ERROR --error --json -o sast.json .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-sast
+          path: sast.json
+
+  # 3 - segredos
+  segredos:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # precisa do historico inteiro
+      - name: Instalar gitleaks
+        run: |
+          curl -sSLo gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSAO}/gitleaks_${GITLEAKS_VERSAO}_linux_x64.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar xzf gitleaks.tar.gz gitleaks
+      - name: Gitleaks no historico
+        run: ./gitleaks git . --redact -f json -r segredos.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-segredos
+          path: segredos.json
+
+  # 4 - SCA
+  sca:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Instalar trivy
+        run: |
+          curl -sSLo trivy.tar.gz https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSAO}/trivy_${TRIVY_VERSAO}_Linux-64bit.tar.gz
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar xzf trivy.tar.gz trivy
+      - name: Dependencias (requirements.txt e worker/requirements.txt)
+        run: ./trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 -f json -o sca.json .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-sca
+          path: sca.json
+
+  # 5 - testes
+  testes:
+    runs-on: ubuntu-22.04
+    needs: build
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.8"
+      - run: |
+          pip install -r requirements.txt
+          pip install pytest==7.4.4
+      - name: Testes
+        run: python -m pytest tests -v --junitxml=testes.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-testes
+          path: testes.xml
+
+  # 6 - build e varredura da imagem
+  imagem:
+    runs-on: ubuntu-22.04
+    needs: [sast, segredos, sca, testes]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Instalar trivy
+        run: |
+          curl -sSLo trivy.tar.gz https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSAO}/trivy_${TRIVY_VERSAO}_Linux-64bit.tar.gz
+          echo "${TRIVY_SHA256}  trivy.tar.gz" | sha256sum -c -
+          tar xzf trivy.tar.gz trivy
+      - name: Build da imagem
+        run: docker build -t "$IMAGEM" .
+      - name: Vulnerabilidades da imagem
+        run: ./trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 -f json -o trivy-image.json "$IMAGEM"
+      - name: Misconfiguracao do Dockerfile
+        run: ./trivy config --severity HIGH,CRITICAL --exit-code 1 -f json -o trivy-config.json .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-imagem
+          path: trivy-*.json
+
+  # 7 - DAST ativo
+  dast:
+    runs-on: ubuntu-22.04
+    needs: imagem
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Subir a aplicacao
+        run: |
+          docker build -t "$IMAGEM" .
+          docker run -d --name app -p "$PORTA:$PORTA" -e PORTA="$PORTA" "$IMAGEM"
+          for i in $(seq 1 20); do curl -fs "http://localhost:$PORTA/" > /dev/null && break; sleep 3; done
+      - name: ZAP full scan (spider + ataque ativo)
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:2.17.0 \
+            zap-full-scan.py -t "http://localhost:$PORTA" -m 5 -J dast.json -r dast.html
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: relatorio-dast
+          path: zap/
+
+  # 8 - deploy (so na main, depois de tudo passar)
+  deploy:
+    runs-on: ubuntu-22.04
+    needs: [build, sast, segredos, sca, testes, imagem, dast]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: producao
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Publicar imagem no GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DESTINO="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+          docker build -t "$DESTINO" .
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$DESTINO"

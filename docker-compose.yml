@@ -1,0 +1,12 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8476:8476"
+    environment:
+      PORTA: "8476"
+  banco:
+    image: postgres:11
+    environment:
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}

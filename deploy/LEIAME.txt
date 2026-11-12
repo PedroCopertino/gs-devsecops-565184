@@ -1,0 +1,1 @@
+Chave de deploy fica fora do repositorio (secret do ambiente).
